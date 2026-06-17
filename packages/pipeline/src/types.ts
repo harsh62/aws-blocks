@@ -3,6 +3,7 @@
 
 import type * as cdk from 'aws-cdk-lib';
 import type * as codebuild from 'aws-cdk-lib/aws-codebuild';
+import type { IFileSetProducer } from 'aws-cdk-lib/pipelines';
 
 /**
  * Configuration for the pipeline source (GitHub/CodeConnections).
@@ -140,6 +141,30 @@ export interface PipelineSynthConfig {
    * Lambda bundling + frontend builds. Use SMALL for trivial apps or LARGE for monorepos.
    */
   readonly computeType?: codebuild.ComputeType;
+
+  /**
+   * A partial CodeBuild BuildSpec merged into the synth step's generated buildspec.
+   *
+   * Use this to control the synth runtime declaratively, most commonly to pin
+   * the Node.js version via `runtime-versions`. It merges with (does not replace)
+   * the install/build commands generated from {@link installCommands} and
+   * {@link commands}, and is orthogonal to the `NODE_OPTIONS` environment variable
+   * injection (one configures the buildspec, the other sets an env var).
+   *
+   * @default a BuildSpec declaring the Node.js 22 runtime:
+   * `BuildSpec.fromObject({ phases: { install: { 'runtime-versions': { nodejs: 22 } } } })`.
+   * Override to select a different runtime or add other buildspec-only settings.
+   *
+   * @example Pin Node.js 20
+   * ```ts
+   * synth: {
+   *   partialBuildSpec: BuildSpec.fromObject({
+   *     phases: { install: { 'runtime-versions': { nodejs: 20 } } },
+   *   }),
+   * }
+   * ```
+   */
+  readonly partialBuildSpec?: codebuild.BuildSpec;
 }
 
 /**
@@ -381,4 +406,20 @@ export interface PipelineProps<TConfig = Record<string, unknown>> {
    * @default false
    */
   readonly crossAccountKeys?: boolean;
+
+  /**
+   * Substitute the pipeline source with an alternative file-set producer.
+   *
+   * When provided, this replaces the GitHub/CodeConnections source created from
+   * {@link source} as the input to the synth step. This exists so the pipeline
+   * can be deployed and exercised in tests without a live GitHub CodeConnections
+   * OAuth handshake (for example, by substituting an S3 source).
+   *
+   * `source` (repo + connectionArn) is still required and validated even when
+   * this override is set, so production configs remain well-formed.
+   *
+   * @internal Not part of the public API. Intended for testing only; the shape
+   * and behavior may change without a major version bump.
+   */
+  readonly _sourceOverride?: IFileSetProducer;
 }

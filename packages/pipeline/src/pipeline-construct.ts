@@ -21,6 +21,7 @@ import type {
   PipelineProps,
   PipelineStageConfig,
 } from './types.js';
+import { __PIPELINE_STAGE_SCOPE__ } from './constants.js';
 
 /**
  * Resolve a relative file path against the calling file's directory.
@@ -384,7 +385,7 @@ function buildCodePipeline<TConfig>(
     ? false
     : (branchConfig.triggerOnPush ?? props.source.triggerOnPush ?? true);
 
-  const source = CodePipelineSource.connection(
+  const source = props._sourceOverride ?? CodePipelineSource.connection(
     props.source.repo,
     branchConfig.branch,
     {
@@ -415,6 +416,9 @@ function buildCodePipeline<TConfig>(
     pipelineType: codepipeline.PipelineType.V2,
     dockerEnabledForSynth: props.synth?.dockerEnabled ?? false,
     synthCodeBuildDefaults: {
+      partialBuildSpec: props.synth?.partialBuildSpec ?? codebuild.BuildSpec.fromObject({
+        phases: { install: { 'runtime-versions': { nodejs: 22 } } },
+      }),
       buildEnvironment: {
         buildImage: props.synth?.buildImage ?? codebuild.LinuxBuildImage.AMAZON_LINUX_2023_5,
         computeType: props.synth?.computeType ?? codebuild.ComputeType.MEDIUM,
@@ -574,7 +578,7 @@ async function importAppFileForStage<TConfig>(
   }
 
   // Set ambient scope for BlocksStack.create() to pick up
-  (globalThis as any).__PIPELINE_STAGE_SCOPE__ = stage;
+  (globalThis as any)[__PIPELINE_STAGE_SCOPE__] = stage;
 
   // Capture current beforeExit listeners before import
   const listenersBefore = process.listeners('beforeExit').slice();
@@ -597,7 +601,7 @@ async function importAppFileForStage<TConfig>(
     }
 
     // Clean up ambient scope
-    delete (globalThis as any).__PIPELINE_STAGE_SCOPE__;
+    delete (globalThis as any)[__PIPELINE_STAGE_SCOPE__];
 
     // Restore process.env
     if (stageEnv) {
