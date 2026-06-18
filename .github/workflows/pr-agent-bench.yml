@@ -1,0 +1,160 @@
+name: PR Agent Bench
+
+# Per-PR LLM-agent benchmark. Each cell scaffolds one template, hands the
+# scaffolded app to a builder agent, runs the build + Playwright spec, then a
+# judge agent grades. Runs entirely on the GitHub runner — no microVM, no S3
+# round-trip. Bedrock provides the model; the runner provides the sandbox.
+#
+# Required configuration (publish environment):
+#   AWS_ROLE_ARN  secret    OIDC role with bedrock:InvokeModelWithResponseStream
+#                           on the bench model, plus s3:PutObject on bench/* in
+#                           the registry bucket (for the result archive).
+#   S3_BUCKET     variable  Registry bucket (existing).
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: pr-agent-bench-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  bench:
+    name: Bench (${{ matrix.template }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    environment: publish
+    # Fork PRs do not get secrets or OIDC by default under `pull_request`,
+    # but defense-in-depth: also gate on same-repo. Mirrors pr-checks.yml.
+    if: github.event.pull_request.head.repo.full_name == github.repository || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        template: [default, demo, bare, react, nextjs, backend, auth-cognito]
+    env:
+      WORKSPACE: ${{ github.workspace }}/bench-app
+      TASK: realtime-todos
+      BENCH_MODEL: us.anthropic.claude-sonnet-4-6
+      # Different model from the builder, on purpose — limits same-model
+      # self-evaluation bias.
+      BENCH_JUDGE_MODEL: us.anthropic.claude-opus-4-8
+      AWS_REGION: us-east-1
+      TEMPLATE: ${{ matrix.template }}
+      PR_NUMBER: ${{ github.event.pull_request.number || 'manual' }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v5
+        with: { node-version-file: '.nvmrc' }
+
+      - run: npm ci
+
+      # Write a baseline result.json BEFORE OIDC/AWS so even an OIDC failure
+      # produces a cell row in the summary table. Every later step augments
+      # this; finalize-result stamps the final status.
+      - name: 0. Init result
+        run: node scripts/agent-bench/steps/0-init-result.mjs
+        env:
+          RESULT_PATH: /tmp/result.json
+
+      - name: Configure AWS credentials (OIDC)
+        id: oidc
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: 1. Init bench-app
+        id: init
+        run: bash scripts/agent-bench/steps/1-init-bench-app.sh "$TEMPLATE"
+
+      - name: 2. Agent run
+        id: agent
+        timeout-minutes: 25
+        run: npx tsx scripts/agent-bench/steps/2-agent-run.ts
+        env:
+          TASK_PROMPT: ${{ github.workspace }}/tasks/${{ env.TASK }}/PROMPT.md
+          OUTPUT: /tmp/builder-result.json
+
+      - name: 3. Build and test
+        id: tests
+        run: bash scripts/agent-bench/steps/3-build-and-test.sh
+        env:
+          TASK_DIR: ${{ github.workspace }}/tasks/${{ env.TASK }}
+
+      - name: 4. Judge
+        id: judge
+        timeout-minutes: 8
+        run: |
+          chmod -R a-w "$WORKSPACE"
+          npx tsx scripts/agent-bench/steps/4-judge.ts
+        env:
+          BUILDER_RESULT: /tmp/builder-result.json
+          TASK_PROMPT: ${{ github.workspace }}/tasks/${{ env.TASK }}/PROMPT.md
+          OUTPUT: /tmp/result.json
+          RESULT_PATH: /tmp/result.json
+          EVIDENCE: |
+            {
+              "scaffolded": true,
+              "build_succeeded": ${{ steps.tests.outputs.build_succeeded }},
+              "dev_server_started": true,
+              "tests_passed": ${{ steps.tests.outputs.tests_passed }},
+              "tests_failed": ${{ steps.tests.outputs.tests_failed }},
+              "tests_total": ${{ steps.tests.outputs.tests_total }}
+            }
+
+      # Stamp final status on result.json — always runs so the summary table
+      # gets a row for failed cells too.
+      - name: Finalize result
+        if: always()
+        run: node scripts/agent-bench/steps/finalize-result.mjs
+        env:
+          RESULT_PATH: /tmp/result.json
+          OUTCOME_OIDC: ${{ steps.oidc.outcome }}
+          OUTCOME_INIT: ${{ steps.init.outcome }}
+          OUTCOME_AGENT: ${{ steps.agent.outcome }}
+          OUTCOME_TESTS: ${{ steps.tests.outcome }}
+          OUTCOME_JUDGE: ${{ steps.judge.outcome }}
+
+      - name: 5. Upload result
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-result-${{ matrix.template }}
+          path: /tmp/result.json
+          retention-days: 90
+          overwrite: true
+
+      - name: Persist to S3 (best-effort)
+        if: always()
+        run: |
+          KEY="bench/pr/${PR_NUMBER}/run-${{ github.run_id }}-attempt-${{ github.run_attempt }}/${TEMPLATE}.json"
+          aws s3 cp /tmp/result.json "s3://${{ vars.S3_BUCKET }}/$KEY" || echo "::warning::S3 archive failed for $KEY"
+
+  summary:
+    needs: bench
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      # Checkout first — it would wipe the workspace if it ran after the
+      # artifact download.
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+          sparse-checkout: scripts/agent-bench
+      - uses: actions/download-artifact@v8
+        with: { path: results, pattern: bench-result-* }
+      - name: Render summary table
+        run: node scripts/agent-bench/steps/summary.mjs
+        env:
+          RESULTS_DIR: results
